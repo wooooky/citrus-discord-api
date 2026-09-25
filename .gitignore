@@ -1,0 +1,17 @@
+# Dependencias
+node_modules/
+
+# Credenciais — NUNCA commitar
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# SO / editores
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
