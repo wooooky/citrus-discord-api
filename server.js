@@ -15,7 +15,10 @@ require('dotenv').config();
 const express = require('express');
 const dns = require('dns');
 const net = require('net');
-const https = require('https');
+// OBS: sem `https` de proposito — NAO chamamos discord.com/api/v10/gateway
+// manualmente. Essa chamada extra causava HTTP 429 e travava o login em
+// "Preparing to connect to the gateway". O proprio discord.js descobre o
+// gateway (/gateway/bot, com auth + fila + rate limit internos).
 const { Client, Events, GatewayIntentBits } = require('discord.js');
 
 const TOKEN = (process.env.DISCORD_TOKEN || '').trim();
@@ -230,8 +233,9 @@ process.on('uncaughtException', (err) => {
   console.error('[process] uncaughtException:', sanitize(err && err.stack ? err.stack : err).slice(0, 800));
 });
 
-// Pre-flight de rede (DNS + TCP + HTTPS) p/ separar "rede bloqueada"
+// Pre-flight de rede (DNS + TCP) p/ separar "rede bloqueada"
 // de "token/intents". Usa so modulos nativos, sem dependencia nova.
+// Sem HTTPS: nenhuma chamada a /api/v10/gateway (evita 429).
 function withTimeout(promise, ms, label) {
   let t;
   const timeout = new Promise((_, reject) => {
@@ -267,22 +271,17 @@ function checkTcp(host, port = 443, ms = 8000) {
   );
 }
 
-function checkHttps(ms = 10000) {
-  return withTimeout(
-    new Promise((resolve, reject) => {
-      const req = https.get('https://discord.com/api/v10/gateway', (res) => {
-        res.resume();
-        resolve(`http=${res.statusCode}`);
-      });
-      req.on('error', reject);
-    }),
-    ms,
-    'https(discord.com/api/v10/gateway)'
-  );
-}
-
+// Pre-flight MINIMO e executado UMA unica vez: so DNS + TCP (sem HTTP).
+// DNS nao toca o Discord; TCP abre/fecha 1 socket curto p/ provar egress
+// WSS. NENHUMA chamada a /api/v10/gateway aqui — isso gerava 429 e o
+// discord.js parava em "Preparing to connect to the gateway".
 async function preflight() {
-  const out = { at: new Date().toISOString(), dns: null, tcp: null, https: null };
+  const out = {
+    at: new Date().toISOString(),
+    dns: null,
+    tcp: null,
+    https: 'skipped (removido p/ evitar 429; gateway via discord.js)',
+  };
   try {
     out.dns = `ok (${await checkDns(GATEWAY_HOST)})`;
     log(`[discord:preflight] DNS ${GATEWAY_HOST} -> ${sanitize(out.dns)}`);
@@ -297,18 +296,22 @@ async function preflight() {
     out.tcp = `FALHA: ${sanitize(e.message).slice(0, 200)}`;
     console.error(`[discord:preflight] TCP FALHOU p/ ${GATEWAY_HOST}:443: ${sanitize(e.message).slice(0, 300)} (egress WSS bloqueado? firewall?)`);
   }
-  try {
-    out.https = await checkHttps();
-    log(`[discord:preflight] HTTPS discord.com/api/v10/gateway -> ${sanitize(out.https)}`);
-  } catch (e) {
-    out.https = `FALHA: ${sanitize(e.message).slice(0, 200)}`;
-    console.error(`[discord:preflight] HTTPS FALHOU: ${sanitize(e.message).slice(0, 300)}`);
-  }
+  log('[discord:preflight] HTTPS /gateway NAO chamado (evita 429; discord.js controla o gateway sozinho).');
   discordState.preflight = out;
   return out;
 }
 
+// Guarda anti-loop: connectDiscord() roda UMA vez por processo. O discord.js
+// cuida de resume/reconnect sozinho; nunca chamamos login() de novo nos
+// handlers (shardDisconnect/reconnecting) p/ nao gerar storm de conexoes (429/4008).
+let connectStarted = false;
+
 async function connectDiscord() {
+  if (connectStarted) {
+    log('[discord] connectDiscord() ja executado — ignorando chamada repetida (anti-loop).');
+    return;
+  }
+  connectStarted = true;
   if (!TOKEN || !OWNER_ID) {
     log('[discord] Login pulado: variaveis de ambiente ausentes. API continua no ar; veja /health.');
     return;
@@ -320,12 +323,16 @@ async function connectDiscord() {
   const attempt = discordState.loginAttempt;
   log(`[discord] Conectando ao Discord... (tentativa ${attempt}, timeout ${LOGIN_TIMEOUT_MS}ms, gateway ${GATEWAY_HOST})`);
 
-  // 1) Pre-flight: se DNS/TCP falhar aqui, o login() vai travar — e ja sabemos o porquê.
+  // 1) Pre-flight minimo (1x, sem HTTP): se DNS/TCP falhar aqui, o login()
+  // vai travar — e ja sabemos o porque, sem ter causado 429 antes.
   await preflight();
 
   // 2) Login com timeout explicito: discord.js nao tem timeout proprio,
   // entao Promise.race evita "para em Conectando..." para sempre.
-  log(`[discord] Chamando client.login() (token ${tokenShape()}, intents Guilds+GuildPresences+GuildMembers)...`);
+  // SEM retry automatico aqui: se der timeout/429, mantemos o processo vivo
+  // e deixamos o discord.js (ou um redeploy manual) decidir — retry em loop
+  // piora rate limit (429/4008). UMA tentativa por boot.
+  log(`[discord] Chamando client.login() UMA vez (token ${tokenShape()}, intents Guilds+GuildPresences+GuildMembers)...`);
   const loginPromise = client.login(TOKEN);
   // Evita unhandledRejection se o timeout vencer mas o login falhar depois.
   loginPromise.then(
@@ -376,15 +383,20 @@ async function connectDiscord() {
     discordState.lastError = `login-failed (code=${code}): ${cleanMsg.slice(0, 300)}`;
     console.error(`[discord] Falha no login (tentativa ${attempt}, code=${code}): ${cleanMsg}`);
     if (String(cleanMsg).startsWith('login-timeout:')) {
-      console.error('[discord] Diagnostico: promise nem resolveu nem rejeitou. Nao e token rejeitado — e rede/gateway travado. Confira [discord:preflight] (DNS/TCP/HTTPS) e [discord:debug] (chegou HELLO? enviou IDENTIFY?).');
+      console.error('[discord] Diagnostico: promise nem resolveu nem rejeitou. Nao e token rejeitado — e gateway travado. Confira [discord:preflight] (DNS/TCP) e [discord:debug] (chegou HELLO? enviou IDENTIFY?). Se parar em "Preparing to connect", o discord.js pode estar aguardando o proprio rate limit interno (429/Retry-After) — NAO reinicie em loop, aguarde e veja /health.');
+    } else if (code === 429 || /429|rate.?limit|retry.?after/i.test(cleanMsg)) {
+      const retryAfter = (e && (e.retryAfter || (e.error && e.error.retry_after))) || 'desconhecido';
+      console.error(`[discord] Rate limited (429) no login. Retry-After=${retryAfter}s. Respeitando o limite: SEM nova tentativa automatica. Aguarde o discord.js liberar ou faca redeploy manual apos alguns minutos.`);
     } else {
       console.error('[discord] Confira: (1) token valido (Bot > Reset Token), (2) PRESENCE + SERVER MEMBERS intents ligadas, (3) bot no mesmo servidor que voce.');
     }
-    // Mantem o processo vivo: a API continua respondendo /health com o erro.
+    // Mantem o processo vivo SEM retry: a API continua respondendo /health com o erro.
   }
 }
 
 let cache = { at: 0, data: null };
+// Janela de rate limit respeitada SEM retry: enquanto vigente, nem chamamos o Discord.
+let rateLimitedUntil = 0;
 
 async function fetchStatus() {
   if (!discordState.connected) {
@@ -393,6 +405,13 @@ async function fetchStatus() {
     throw err;
   }
   const now = Date.now();
+  if (now < rateLimitedUntil) {
+    const waitS = Math.ceil((rateLimitedUntil - now) / 1000);
+    const err = new Error(`discord rate limited, tente de novo em ${waitS}s`);
+    err.code = 'RATE_LIMITED';
+    err.retryAfter = waitS;
+    throw err;
+  }
   if (cache.data && now - cache.at < CACHE_TTL) return cache.data;
   const guilds = Array.from(client.guilds.cache.values());
   let member = null;
@@ -400,7 +419,23 @@ async function fetchStatus() {
     try {
       const found = await guild.members.fetch(OWNER_ID);
       if (found) { member = found; break; }
-    } catch (_) { /* tenta o proximo servidor */ }
+    } catch (e) {
+      // Respeita 429: para o loop IMEDIATAMENTE (nao tenta o proximo servidor),
+      // registra Retry-After e deixa o discord.js esvaziar a fila sozinho.
+      const status = e && (e.status ?? e.code);
+      const msg = sanitize(e && e.message ? e.message : e);
+      if (status === 429 || /429|rate.?limit/i.test(msg)) {
+        const retryS = Math.ceil(Number(e.retryAfter ?? (e.error && e.error.retry_after) ?? 5) || 5);
+        rateLimitedUntil = Date.now() + retryS * 1000;
+        discordState.lastError = `rate-limited (retry_after=${retryS}s)`;
+        console.error(`[discord:rateLimit] 429 em guild.members.fetch. Retry-After=${retryS}s. Pausando chamadas ate ${new Date(rateLimitedUntil).toISOString()} (sem retry em loop).`);
+        const err = new Error(`discord rate limited, retry em ${retryS}s`);
+        err.code = 'RATE_LIMITED';
+        err.retryAfter = retryS;
+        throw err;
+      }
+      /* outro erro (ex: membro ausente): tenta o proximo servidor, 1x cada, sem repetir */
+    }
   }
   if (!member) {
     const err = new Error('owner-not-found (bot e dono no mesmo servidor? intents ligadas?)');
@@ -444,6 +479,12 @@ app.get('/api/status', async (req, res) => {
     res.set('Cache-Control', 'no-store');
     res.json(await fetchStatus());
   } catch (e) {
+    // 429 repassa Retry-After p/ o site aguardar em vez de pollingar o Discord.
+    if (e && e.code === 'RATE_LIMITED') {
+      const retryAfter = Number(e.retryAfter) || 5;
+      res.set('Retry-After', String(retryAfter));
+      return res.status(429).json({ error: 'rate_limited', detail: 'RATE_LIMITED', retryAfter });
+    }
     res.status(503).json({ error: 'offline', detail: e && e.code ? e.code : 'unknown' });
   }
 });
